@@ -2358,6 +2358,103 @@ function VoteBar({buyVotes,sellVotes}){
   );
 }
 
+// ── RunRow — proper component so useState is never called inside .map() ──
+function RunRow({r}){
+  const [expanded,setExpanded]=React.useState(false);
+  const rawPnl=+(r.endBal-r.startBal).toFixed(2);
+  const won=rawPnl>=0;
+  const wr2=r.trades>0?Math.round(r.wins/r.trades*100):0;
+  return(
+    <div style={{background:PANEL,borderRadius:"8px",marginBottom:"6px",
+      border:`1px solid ${won?GREEN+"30":RED+"30"}`,borderLeft:`3px solid ${won?GREEN:RED}`}}>
+      {/* Header row — tap to expand */}
+      <div onClick={()=>setExpanded(e=>!e)} style={{padding:"12px 14px",cursor:"pointer"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"6px"}}>
+          <div style={{display:"flex",gap:"8px",alignItems:"center"}}>
+            <span style={{fontSize:"12px",fontWeight:"700",color:TEXT}}>Run #{r.runNum}</span>
+            {r.ts&&<span style={{fontSize:"8px",color:DIM,fontFamily:"'JetBrains Mono',monospace"}}>{fmtDateShort(r.ts)}</span>}
+            {r.duration>0&&<span style={{fontSize:"8px",color:DIM}}>{fmtDur(r.duration)}</span>}
+          </div>
+          <div style={{display:"flex",gap:"8px",alignItems:"center"}}>
+            <span style={{fontSize:"16px",fontWeight:"700",color:won?GREEN:RED,fontFamily:"'JetBrains Mono',monospace"}}>
+              {won?"+":""}${rawPnl.toFixed(2)}
+            </span>
+            <span style={{fontSize:"10px",color:DIM}}>{expanded?"▲":"▼"}</span>
+          </div>
+        </div>
+        <div style={{display:"flex",gap:"10px",flexWrap:"wrap",fontSize:"9px",color:DIM}}>
+          <span style={{fontFamily:"'JetBrains Mono',monospace"}}>${r.startBal?.toFixed(2)} → <span style={{color:won?GREEN:RED}}>${r.endBal?.toFixed(2)}</span></span>
+          <span>{r.trades||0} trades · <span style={{color:wr2>50?GREEN:wr2>35?GOLD:RED,fontWeight:"600"}}>{wr2}% WR</span></span>
+          {r.tp3>0&&<span style={{color:GOLD}}>🏆 {r.tp3} TP3</span>}
+          {r.locked>0&&<span style={{color:GOLD}}>🔒 +${r.locked?.toFixed(2)} locked</span>}
+        </div>
+      </div>
+      {/* Expanded trade list */}
+      {expanded&&(
+        <div style={{borderTop:`1px solid ${BORDER}`,padding:"10px 12px"}}>
+          {(!r.log||r.log.length===0)?(
+            <div style={{fontSize:"9px",color:DIM,textAlign:"center",padding:"8px 0"}}>No trade log for this run</div>
+          ):(
+            <>
+              <div style={{fontSize:"9px",color:DIM,marginBottom:"8px",textTransform:"uppercase",letterSpacing:"0.5px"}}>
+                Trade Log · {r.log.length} trade{r.log.length!==1?"s":""}
+              </div>
+              {r.log.map((e,j)=>{
+                const tpH=e.tpHits||[];
+                const hasTp1=tpH.some(x=>x==="TP1");
+                const hasTp2=tpH.some(x=>x==="TP2");
+                const hasTp3=tpH.some(x=>x==="TP3🏆");
+                const finalR=e.finalResult||e.result||"";
+                const isSL=finalR==="SL"||finalR==="TRAIL";
+                const epnl=+(e.pnl||0);
+                const tradeNum=r.log.length-j;
+                return(
+                  <div key={j} style={{padding:"7px 10px",marginBottom:"4px",borderRadius:"6px",
+                    background:epnl>=0?"#071207":"#120507",
+                    borderLeft:`2px solid ${epnl>=0?GREEN:RED}`}}>
+                    {/* Row 1: number, direction, TP/SL badges, P&L */}
+                    <div style={{display:"flex",alignItems:"center",gap:"5px",marginBottom:"3px"}}>
+                      <span style={{fontSize:"8px",color:DIM,fontFamily:"'JetBrains Mono',monospace",flexShrink:0,minWidth:"20px"}}>#{tradeNum}</span>
+                      <span style={{fontSize:"9px",fontWeight:"700",color:e.dir==="BUY"?GREEN:RED,flexShrink:0}}>
+                        {e.dir==="BUY"?"▲ BUY":"▼ SELL"}
+                      </span>
+                      <div style={{display:"flex",gap:"3px",flex:1,flexWrap:"wrap"}}>
+                        {[["TP1",hasTp1,GREEN,"✅"],["TP2",hasTp2,GREEN,"✅"],["TP3",hasTp3,GOLD,"🏆"]].map(([lbl,hit,col,ico])=>(
+                          <span key={lbl} style={{fontSize:"7px",padding:"1px 4px",borderRadius:"3px",fontWeight:"700",
+                            color:hit?col:"#2a2a2a",background:hit?col+"18":"#111",
+                            border:`1px solid ${hit?col+"40":"#1e1e1e"}`}}>
+                            {lbl}{hit?ico:""}
+                          </span>
+                        ))}
+                        {isSL&&(
+                          <span style={{fontSize:"7px",padding:"1px 4px",borderRadius:"3px",fontWeight:"700",
+                            color:RED,background:RED+"18",border:`1px solid ${RED}40`}}>SL❌</span>
+                        )}
+                      </div>
+                      <span style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:"700",fontSize:"10px",
+                        color:epnl>=0?GREEN:RED,flexShrink:0}}>
+                        {epnl>=0?"+":""}${epnl.toFixed(2)}
+                      </span>
+                    </div>
+                    {/* Row 2: entry→exit, lots, date */}
+                    <div style={{display:"flex",gap:"6px",alignItems:"center",flexWrap:"wrap"}}>
+                      <span style={{fontSize:"7px",color:"#444",fontFamily:"'JetBrains Mono',monospace"}}>
+                        {e.entry}→{e.exitP||"…"}
+                      </span>
+                      {e.lots!=null&&<span style={{fontSize:"7px",color:"#333"}}>×{e.lots}L</span>}
+                      {e.ts&&<span style={{fontSize:"7px",color:"#2a2a2a",marginLeft:"auto"}}>{fmtDateShort(e.ts)}</span>}
+                    </div>
+                  </div>
+                );
+              })}
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function MTFBadge({bias}){
   if(bias===0)return<span style={{fontSize:"8px",color:DIM,padding:"1px 5px",background:"#111",borderRadius:"3px",fontFamily:"'JetBrains Mono',monospace"}}>HTF neutral</span>;
   const col=bias>0?GREEN:RED,label=bias>0?"HTF BULL ↑":"HTF BEAR ↓";
@@ -4818,76 +4915,9 @@ function App(){
                 <div style={{fontSize:"12px"}}>No runs yet</div>
                 <div style={{fontSize:"9px",marginTop:"6px",color:DIM}}>Press ↺ to end a run and save it here</div>
               </div>
-            ):runHistory.map((r,i)=>{
-              const pnl=+(r.endBal-r.startBal+( r.locked||0)).toFixed(2);
-              const rawPnl=+(r.endBal-r.startBal).toFixed(2);
-              const won=rawPnl>=0;
-              const wr2=r.trades>0?Math.round(r.wins/r.trades*100):0;
-              const [expanded,setExpanded]=React.useState(false);
-              return(
-                <div key={i} style={{background:PANEL,borderRadius:"8px",
-                  border:`1px solid ${won?GREEN+"30":RED+"30"}`,borderLeft:`3px solid ${won?GREEN:RED}`}}>
-                  {/* Run header — tappable to expand */}
-                  <div onClick={()=>setExpanded(e=>!e)} style={{padding:"12px 14px",cursor:"pointer"}}>
-                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"6px"}}>
-                      <div style={{display:"flex",gap:"8px",alignItems:"center"}}>
-                        <span style={{fontSize:"12px",fontWeight:"700",color:TEXT}}>Run #{r.runNum}</span>
-                        {r.ts&&<span style={{fontSize:"8px",color:DIM,fontFamily:"'JetBrains Mono',monospace"}}>{fmtDateShort(r.ts)}</span>}
-                        {fmtDur(r.duration)&&r.duration>0&&<span style={{fontSize:"8px",color:DIM}}>{fmtDur(r.duration)}</span>}
-                      </div>
-                      <div style={{display:"flex",gap:"8px",alignItems:"center"}}>
-                        <span style={{fontSize:"16px",fontWeight:"700",color:won?GREEN:RED,fontFamily:"'JetBrains Mono',monospace"}}>
-                          {won?"+":""}${rawPnl.toFixed(2)}
-                        </span>
-                        <span style={{fontSize:"10px",color:DIM}}>{expanded?"▲":"▼"}</span>
-                      </div>
-                    </div>
-                    <div style={{display:"flex",gap:"10px",flexWrap:"wrap",fontSize:"9px",color:DIM}}>
-                      <span style={{fontFamily:"'JetBrains Mono',monospace"}}>${r.startBal?.toFixed(2)} → <span style={{color:won?GREEN:RED}}>${r.endBal?.toFixed(2)}</span></span>
-                      <span>{r.trades||0} trades · <span style={{color:wr2>50?GREEN:wr2>35?GOLD:RED,fontWeight:"600"}}>{wr2}% WR</span></span>
-                      {r.tp3>0&&<span style={{color:GOLD}}>🏆 {r.tp3} TP3</span>}
-                      {r.locked>0&&<span style={{color:GOLD}}>🔒 +${r.locked?.toFixed(2)} locked</span>}
-                    </div>
-                  </div>
-                  {/* Expanded: all trades in this run */}
-                  {expanded&&r.log&&r.log.length>0&&(
-                    <div style={{borderTop:`1px solid ${BORDER}`,padding:"10px 12px"}}>
-                      <div style={{fontSize:"9px",color:DIM,marginBottom:"8px",textTransform:"uppercase"}}>
-                        Trade Log · {r.log.length} entries
-                      </div>
-                      {r.log.map((e,j)=>{
-                        const tpH=e.tpHits||[];
-                        const hasTp1=tpH.some(r=>r==="TP1"),hasTp2=tpH.some(r=>r==="TP2"),hasTp3=tpH.some(r=>r==="TP3🏆");
-                        const isSL=(e.finalResult||e.result)==="SL"||(e.finalResult||e.result)==="TRAIL";
-                        const pnl=e.pnl||0;
-                        return(
-                        <div key={j} style={{padding:"7px 10px",marginBottom:"3px",borderRadius:"5px",
-                          background:pnl>=0?"#071207":"#120507",borderLeft:`2px solid ${pnl>=0?GREEN:RED}`,flexWrap:"wrap"}}>
-                          <div style={{display:"flex",alignItems:"center",gap:"5px",marginBottom:"2px"}}>
-                            <span style={{fontSize:"9px",color:DIM,fontFamily:"'JetBrains Mono',monospace",flexShrink:0,minWidth:"18px"}}>#{r.log.length-j}</span>
-                            <span style={{fontSize:"9px",fontWeight:"700",color:e.dir==="BUY"?GREEN:RED,flexShrink:0}}>{e.dir==="BUY"?"▲":"▼"} {e.dir}</span>
-                            <div style={{display:"flex",gap:"2px",flex:1}}>
-                              {[["TP1",hasTp1,GREEN],["TP2",hasTp2,GREEN],["TP3",hasTp3,GOLD]].map(([label,hit,col])=>(
-                                <span key={label} style={{fontSize:"7px",padding:"0 4px",borderRadius:"2px",
-                                  color:hit?col:"#333",background:hit?col+"18":"#111",border:`1px solid ${hit?col+"40":"#1a1a1a"}`}}>
-                                  {label}{hit?(label==="TP3"?"🏆":"✅"):""}
-                                </span>
-                              ))}
-                              {isSL&&<span style={{fontSize:"7px",padding:"0 4px",borderRadius:"2px",color:RED,background:RED+"18",border:`1px solid ${RED}40`}}>SL❌</span>}
-                            </div>
-                            <span style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:"700",fontSize:"10px",color:pnl>=0?GREEN:RED,flexShrink:0}}>{pnl>=0?"+":""}${pnl.toFixed(2)}</span>
-                          </div>
-                          <div style={{fontSize:"7px",color:"#333",fontFamily:"'JetBrains Mono',monospace"}}>{e.entry}→{e.exitP} {e.ts?fmtDateShort(e.ts):""}</div>
-                        </div>
-                      );})}
-                    </div>
-                  )}
-                  {expanded&&(!r.log||r.log.length===0)&&(
-                    <div style={{borderTop:`1px solid ${BORDER}`,padding:"10px 12px",fontSize:"9px",color:DIM,textAlign:"center"}}>No trade log for this run</div>
-                  )}
-                </div>
-              );
-            })}
+            ):runHistory.map((r,i)=>(
+              <RunRow key={i} r={r}/>
+            ))}
           </div>
         )}
 
