@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no"/>
-<title>MONEY HEIST v11 · HGEv5 INTEGRATED · XAU/USD HFT</title>
+<title>MONEY HEIST v10 · HGEv5 INTEGRATED · XAU/USD HFT</title>
 
 <!-- PWA Meta Tags -->
 <meta name="application-name" content="Money Heist v10"/>
@@ -45,7 +45,7 @@ if('serviceWorker' in navigator){
 <body style="margin:0;background:#060608">
 <div id="boot">
   <div id="boot-logo">&#x1F4B0;</div>
-  <div id="boot-title">MONEY HEIST v11</div>
+  <div id="boot-title">MONEY HEIST v10</div>
   <div id="boot-sub">XAU/USD &middot; HGEv5 KILL TIERS &middot; $15–$80/TRADE</div>
   <div id="boot-bar-wrap"><div id="boot-bar"></div></div>
   <div id="boot-msg" id="boot-msg">Loading...</div>
@@ -307,6 +307,10 @@ function calcHFTSL({cs, dir, entry, atr, spread, hourGMT, balance, inst="XAUUSD"
   // Layer 4: scale by session volatility
   const sessMult=getSessionSLMult(hourGMT||0);
   rawSL=rawSL*sessMult;
+  // Layer 4b: vote-based tightening — weak signals get tighter SL to limit losses
+  // High conviction (≥5 votes) gets room to breathe; low conviction (≤3) stays tight
+  const voteTightener = score>=5?1.10 : score>=4?1.00 : score>=3?0.88 : 0.78;
+  rawSL=rawSL*voteTightener;
 
   // Layer 5: minimum 1.5×ATR — price must have room to breathe through normal candle noise
   rawSL=Math.max(rawSL, atr*1.5);
@@ -464,114 +468,137 @@ function hgeUpdateKillMode({balance, dayStartBal, lastTrades, hour, mktState, ca
   return _hgeKillMode;
 }
 
-// ── calcHFTLots — CONSERVATIVE + SMART RECOVERY ENGINE ───────────
+// ── calcHFTLots — PROFIT-FIRST RISK ENGINE ────────────────────────
+// ══════════════════════════════════════════════════════════════════
+//  calcHFTLots — VOTE-DRIVEN SAFE SIZER
 //
-//  NORMAL MODE (< 3 consecutive losses):
-//    Uses small, balance-proportional lots. Only scales up with 5+ votes.
-//    Lots: 0.02–0.08 base. Never risks >4% of balance on any single trade.
+//  Design goals:
+//   1. Votes ≤3 → small lots (0.02–0.08). Signals are borderline.
+//   2. Votes ≥4 → meaningful lots, scaled to balance.
+//   3. Recovery: covers last loss at TP2, NOT via over-leveraging.
+//      Max recovery risk = 12% of balance (not 30% — that blew the account).
+//   4. Account protection: absolute dollar caps by balance tier.
+//   5. Profits NOT reinvested at full size until balance grows.
 //
-//  RECOVERY MODE (≥ 3 consecutive losses):
-//    Triggered automatically. Uses dynamic lot sizing to recover the
-//    accumulated loss deficit WITHOUT blowing the account:
-//    - Target: recover total losses over the next 2-3 winning trades
-//    - Recovery lot = sized so TP1+TP2 combined covers ~50% of the deficit
-//    - Hard cap: never risk more than 12% of current balance in recovery
-//    - Auto-exit: once cumulative recovery P&L ≥ total loss deficit → NORMAL
-//
+//  MATH (XAU, SL~$5, pip=$10, balance=$100):
+//   Votes=2-3: risk=$4 → lots=$4/50=$0.08. TP1 win=$7.20. Loss=$4.
+//   Votes=4:   risk=$7 → lots=$7/50=$0.14. TP1 win=$12.6. Loss=$7.
+//   Votes=5+:  risk=$10→ lots=$10/50=$0.20. TP1 win=$18. Loss=$10.
+// ══════════════════════════════════════════════════════════════════
 function calcHFTLots({balance, dayStartBal, strength, slD, score, inst="XAUUSD",
                       startBalance, streak, livePrice, hourGMT, seteRegime, mktState}){
   const pip = 10;
 
+  // ── STATE ────────────────────────────────────────────────────────
   const drawdownPct = (dayStartBal-balance)/Math.max(dayStartBal,0.01);
   const inCaution   = drawdownPct >= CAUTION_PCT;
   const inDanger    = drawdownPct >= DAILY_STOP_PCT*0.75;
   const streakDir   = streak?.dir||"";
   const streakCur   = streak?.cur||0;
-  const totalLossDebt = streak?.lastLossDollars||0;
-
-  // RECOVERY triggers at 3+ consecutive losses (not 1)
-  const inRecovery  = streakDir==="L" && streakCur>=3 && totalLossDebt>0;
+  // Recovery mode: requires 3+ consecutive losses (not 1 — single losses are normal)
+  const inRecovery  = streakDir==="L" && streakCur>=3;
   const hotStreak   = streakDir==="W" && streakCur>=3;
   const phase       = (balance/Math.max(startBalance||dayStartBal,0.01))<2?1
                     : (balance/Math.max(startBalance||dayStartBal,0.01))<6?2:3;
 
+  // ── HMR ──────────────────────────────────────────────────────────
   const dayUTC=_btCandleTs?new Date(_btCandleTs).getUTCDay():new Date().getUTCDay();
   const hmrActive=hourGMT!=null&&(
     hourGMT>=23.5||hourGMT<0.1||
     (dayUTC===5&&hourGMT>=20)||(dayUTC===0&&hourGMT<1.0)
   );
 
-  const votes = score || Math.round((strength||40)/100 * MAX_SCORE);
-  const effectiveSLD = Math.max(slD, 1.00);
-  const goldPrice = livePrice || 3300;
-  let lots, riskDollars;
+  // ── VOTE COUNT → BASE RISK % ──────────────────────────────────────
+  // Votes ≤3 = weak signal → small risk. Votes ≥5 = high conviction → larger.
+  // These % are of CURRENT balance, compounded naturally.
+  const votes = score || Math.max(2, Math.round((strength||40)/100 * MAX_SCORE));
+  let baseRiskPct;
+  if     (votes >= 6) baseRiskPct = 0.10; // 10% — ultra-conviction
+  else if(votes >= 5) baseRiskPct = 0.08; // 8%  — strong
+  else if(votes >= 4) baseRiskPct = 0.06; // 6%  — solid
+  else                baseRiskPct = 0.03; // 3%  — weak, stay small
 
-  if(inRecovery && !inDanger){
-    // ── RECOVERY LOT SIZING ───────────────────────────────────────
-    // Goal: recover totalLossDebt over ~2 winning trades.
-    // Each win at TP1+TP2 = (0.25×1.8 + 0.25×3.2) × slD × lots × pip
-    //                      = (0.45 + 0.80) × slD × lots × pip
-    //                      = 1.25 × slD × lots × pip
-    // So lots needed per trade = (debt/2) / (1.25 × slD × pip)
-    const debtPerTrade = totalLossDebt / 2;
-    const recoveryLots = debtPerTrade / (1.25 * effectiveSLD * pip);
+  // ── BALANCE-TIER ABSOLUTE CAP ─────────────────────────────────────
+  // This prevents "recovery" trades from blowing the account.
+  // No single trade can exceed this dollar amount regardless of votes.
+  // Profit protection: if balance has grown significantly above start,
+  // risk only from a protected base — don't bet all profits at once.
+  // Risk anchor = min(balance, dayStartBal × 1.5) to protect daily gains.
+  const riskAnchor = (startBalance && balance > startBalance*1.5)
+    ? Math.min(balance, dayStartBal*1.20)  // protect profits above 20% daily gain
+    : balance;
+  const balanceCap = riskAnchor < 75   ? riskAnchor*0.10
+                   : riskAnchor < 150  ? riskAnchor*0.09
+                   : riskAnchor < 300  ? riskAnchor*0.08
+                   : riskAnchor < 500  ? riskAnchor*0.07
+                   : riskAnchor*0.05;
 
-    // Cap recovery: never risk more than 12% of current balance
-    const maxRecoveryRisk = balance * (inCaution ? 0.07 : 0.12);
-    const cappedLots = Math.min(recoveryLots, maxRecoveryRisk / (effectiveSLD * pip));
+  // ── BASE RISK DOLLARS ────────────────────────────────────────────
+  let riskDollars = Math.min(balance * baseRiskPct, balanceCap);
 
-    // Must also be at least as large as normal trade (don't under-size recovery)
-    const normalBase = balance * 0.025 / (effectiveSLD * pip);
-    lots = Math.max(cappedLots, normalBase);
-    riskDollars = lots * effectiveSLD * pip;
-  } else {
-    // ── NORMAL CONSERVATIVE LOT SIZING ───────────────────────────
-    // Vote tier → risk%:  2-3=0.8%  4=1.5%  5=2.5%  6+=4%
-    let riskPct;
-    if     (votes >= 6) riskPct = inDanger ? 0.015 : inCaution ? 0.025 : 0.040;
-    else if(votes >= 5) riskPct = inDanger ? 0.008 : inCaution ? 0.015 : 0.025;
-    else if(votes >= 4) riskPct = inDanger ? 0.005 : inCaution ? 0.010 : 0.015;
-    else                riskPct = inDanger ? 0.002 : inCaution ? 0.005 : 0.008;
+  // ── HOT STREAK: gentle boost (max +20%) ──────────────────────────
+  if(hotStreak && !inDanger) riskDollars = Math.min(riskDollars * 1.20, balanceCap);
 
-    const streakBoost = hotStreak ? 1.15 : 1.0;
-    riskDollars = balance * riskPct * streakBoost;
-    lots = riskDollars / (effectiveSLD * pip);
-
-    // Vote-tier hard floors/ceilings (lots)
-    if(votes <= 3){ lots = Math.max(lots, 0.02); lots = Math.min(lots, 0.04); }
-    else if(votes === 4){ lots = Math.max(lots, 0.04); lots = Math.min(lots, balance * 0.00015 + 0.06); }
-    else if(votes === 5){ lots = Math.max(lots, 0.06); lots = Math.min(lots, balance * 0.0003 + 0.08); }
-    // votes >= 6: only capped by account-size caps below
+  // ── RECOVERY MODE (3+ consecutive losses) ───────────────────────
+  // Size to aggressively recover debt while protecting remaining capital.
+  // Strategy: TP1+TP2 combined should cover the total accumulated loss.
+  // TP1 at 1.8×SL closes 25%: profit = 0.25 × 1.8 × slD × lots × pip = 0.45 × risk
+  // TP2 at 3.2×SL closes 25%: profit = 0.25 × 3.2 × slD × lots × pip = 0.80 × risk
+  // Combined TP1+TP2 = 1.25 × riskDollars
+  // So to recover totalDebt via TP1+TP2: riskDollars = totalDebt / 1.25 = totalDebt × 0.80
+  if(inRecovery){
+    const totalDebt = streak?.lastLossDollars || 0;
+    if(totalDebt > 0){
+      const recoveryRisk = totalDebt * 0.80; // target: TP1+TP2 clears the debt
+      // Cap: progressive based on balance size
+      // - Never more than 15% of current balance (protect what's left)
+      // - Never less than base risk (recovery must be meaningful)
+      const recoveryCap = Math.min(balance * 0.15, Math.max(balance * 0.08, recoveryRisk));
+      riskDollars = Math.max(riskDollars, Math.min(recoveryRisk, recoveryCap));
+    } else {
+      // In recovery but no loss amount tracked: use 12% sizing
+      riskDollars = Math.max(riskDollars, balance * 0.12);
+    }
   }
 
-  if(hmrActive){ lots *= 0.50; riskDollars *= 0.50; }
+  // ── DRAWDOWN PROTECTION ──────────────────────────────────────────
+  if(inDanger)       riskDollars *= 0.40;
+  else if(inCaution) riskDollars *= 0.70;
+  if(hmrActive)      riskDollars *= 0.50;
 
-  // Margin guard
+  // ── FINAL CAPS ───────────────────────────────────────────────────
+  // Never exceed balance-tier cap or 15% of balance absolutely.
+  riskDollars = Math.min(riskDollars, balanceCap, balance * 0.15);
+  riskDollars = Math.max(riskDollars, 0.30); // floor: at least 30 cents
+
+  // ── LOT CALCULATION ──────────────────────────────────────────────
+  const effectiveSLD = Math.max(slD, 2.00); // min SL floor
+  const lotRaw = riskDollars / (effectiveSLD * pip);
+
+  // ── MARGIN GUARD ─────────────────────────────────────────────────
+  const goldPrice = livePrice || 4700;
   const marginPerLot = (goldPrice * 100) / EXNESS_LEVERAGE;
-  const maxLotsMargin = (balance * EXNESS_MARGIN_SAFETY) / Math.max(marginPerLot, 1);
+  const maxLotsMargin = (balance * 0.20) / Math.max(marginPerLot, 1);
 
-  // Conservative balance-proportional hard caps
-  const maxLotsByBal = balance < 100  ? 0.15
-                     : balance < 300  ? 0.40
-                     : balance < 1000 ? 1.00
-                     : balance < 5000 ? 3.00
-                     : 5.00;
+  // ── LOT CAPS BY VOTE COUNT AND BALANCE ───────────────────────────
+  // Small votes = small lots (0.02–0.08). Large votes = up to 0.20 on small accounts.
+  const maxLotByVote = votes>=6 ? 0.50 : votes>=5 ? 0.35 : votes>=4 ? 0.20 : 0.08;
+  const maxLotByBal  = balance<100  ? 0.20
+                     : balance<300  ? 0.60
+                     : balance<1000 ? 2.00
+                     : 4.00;
 
-  // In recovery allow slightly higher cap so we can actually recover
-  const recoveryCapMult = inRecovery ? 1.5 : 1.0;
-
-  lots = +Math.min(
-    Math.max(lots, MIN_LOT),
-    maxLotsByBal * recoveryCapMult,
+  const lots = +Math.min(
+    Math.max(lotRaw, MIN_LOT),
+    maxLotByVote,
+    maxLotByBal,
     maxLotsMargin,
-    5.0
+    MAX_LOT_NORMAL
   ).toFixed(4);
 
-  riskDollars = +(lots * effectiveSLD * pip).toFixed(2);
-  const riskPct2 = riskDollars / Math.max(balance, 0.01);
-
-  return{lots, riskDollars, riskPct:riskPct2,
-         phase, hotStreak, inRecovery, hmrActive, votes, streakCur,
+  const riskPct = riskDollars/Math.max(balance,0.01);
+  return{lots, riskDollars:+riskDollars.toFixed(2), riskPct,
+         phase, hotStreak, inRecovery, hmrActive,
          killMode:"VOTE", equityGuard:inDanger?"REDUCE":"NORMAL"};
 }
 
@@ -1322,21 +1349,94 @@ function isFakeBO(fakeLog, level, dir, nowTs){
   return fakeLog.some(f=>f.dir===dir&&Math.abs(f.level-level)<tol&&ref-f.t<18*60*1000);
 }
 
-// getMTFBias — returns +1 (bullish), -1 (bearish), or 0 (neutral) based on H1 trend
+// ══════════════════════════════════════════════════════════════════
+//  getMTFBias — FULL CASCADE MULTI-TIMEFRAME ANALYSIS
+//  D1 → H4 → H1 → M15 → M5 → M1 (top-down then bottom-up)
+//
+//  Each TF scores -2 to +2:
+//    +2: strongly bullish (EMA up + bull structure + high close)
+//    +1: mildly bullish
+//     0: neutral / conflicted
+//    -1: mildly bearish
+//    -2: strongly bearish
+//
+//  Final bias: weighted sum (higher TFs carry more weight)
+//  Returns: +1 (net bullish), -1 (net bearish), 0 (neutral)
+//
+//  Sources used for each TF:
+//    • EMA trend (close > EMA20 = bull)
+//    • Candle structure (bull/bear count, HH-HL vs LH-LL)
+//    • ATR expansion (confirms momentum direction)
+//    • Distance from recent swing (premium/discount)
+// ══════════════════════════════════════════════════════════════════
+function getTFScore(candles){
+  if(!candles||candles.length<5) return 0;
+  const n=Math.min(candles.length,20);
+  const sl=candles.slice(-n);
+  const c=sl[sl.length-1];
+
+  // EMA20 (simple approximation — EMA≈SMA for short windows)
+  const ema20=sl.reduce((s,x)=>s+x.close,0)/sl.length;
+  const emaScore=c.close>ema20*1.0003?1:c.close<ema20*0.9997?-1:0;
+
+  // Bull/bear candle ratio over last 8 bars
+  const recent=sl.slice(-8);
+  const bulls=recent.filter(x=>x.bull).length;
+  const structScore=bulls>=6?2:bulls>=5?1:bulls<=2?-2:bulls<=3?-1:0;
+
+  // Momentum: last close vs 5 bars ago
+  const ref=sl[Math.max(0,sl.length-6)].close;
+  const momPct=(c.close-ref)/Math.max(ref,1)*100;
+  const momScore=momPct>0.15?1:momPct<-0.15?-1:0;
+
+  // Price position in recent range (premium>0.65=bear, discount<0.35=bull)
+  const hi=Math.max(...sl.map(x=>x.high)),lo=Math.min(...sl.map(x=>x.low));
+  const pos=hi>lo?(c.close-lo)/(hi-lo):0.5;
+  const posScore=pos>0.75?-1:pos<0.25?1:0;
+
+  return Math.max(-2,Math.min(2, emaScore+Math.sign(structScore)+momScore+posScore));
+}
+
 function getMTFBias(tfCandles){
   try{
-    const h1=tfCandles&&tfCandles.h1;
-    if(!h1||h1.length<6)return 0;
-    const s=h1.slice(-6);
-    const bullCount=s.filter(c=>c.bull).length;
-    if(bullCount>=5)return 1;   // strongly bullish
-    if(bullCount<=1)return -1;  // strongly bearish
-    // Check EMA-style trend: last close vs first close
-    const first=s[0].close, last=s[s.length-1].close;
-    if(last>first*1.0005)return 1;
-    if(last<first*0.9995)return -1;
+    if(!tfCandles) return 0;
+    // Weights: D1 most important, M5 least
+    const tfs=[
+      {key:"d1",  weight:4.0},
+      {key:"h4",  weight:3.0},
+      {key:"h1",  weight:2.0},
+      {key:"m15", weight:1.5},
+      {key:"m5",  weight:1.0},
+    ];
+    let totalWeight=0, weightedScore=0;
+    for(const{key,weight} of tfs){
+      const candles=tfCandles[key];
+      if(!candles||candles.length<3) continue;
+      const score=getTFScore(candles);
+      weightedScore+=score*weight;
+      totalWeight+=weight;
+    }
+    if(totalWeight===0) return 0;
+    const net=weightedScore/totalWeight;
+    // Require net > 0.40 to call bullish, < -0.40 for bearish
+    if(net>0.40) return 1;
+    if(net<-0.40) return -1;
     return 0;
   }catch(_){return 0;}
+}
+
+// Full MTF detail string for display (shows each TF direction)
+function getMTFDetail(tfCandles){
+  try{
+    if(!tfCandles) return "";
+    const map={d1:"D1",h4:"H4",h1:"H1",m15:"M15",m5:"M5"};
+    return Object.entries(map).map(([k,label])=>{
+      const c=tfCandles[k];
+      if(!c||c.length<3) return null;
+      const s=getTFScore(c);
+      return s>0?`${label}↑`:s<0?`${label}↓`:`${label}—`;
+    }).filter(Boolean).join(" ");
+  }catch{return "";}
 }
 
 // getActiveNewsTrade — returns a news event happening right now that suggests a direction
@@ -1593,8 +1693,14 @@ function masterSignal({cs,hour,kL,spread,orb,news,newsArr,fakeLog,minConf,tfCand
   const totalVotes=rawDir==="BUY"?B:S;
   if(maxFamVotes<2&&totalVotes<effectiveMinConf)return null;
 
-  // MTF bias: used for display/confirmation tags only — no longer hard-vetos signals
+  // MTF bias: HARD VETO for low-conviction signals (≤3 votes)
+  // High conviction (≥4 votes) can trade against HTF — momentum can override structure.
+  // Low conviction needs HTF alignment to avoid fighting the trend.
   const hasMTFData=tfCandles&&tfCandles.h1&&tfCandles.h1.length>=3;
+  if(hasMTFData && totalVotes<=3 && mtfBias!==0){
+    const aligned=(mtfBias>0&&rawDir==="BUY")||(mtfBias<0&&rawDir==="SELL");
+    if(!aligned) return null; // low-conviction signal against HTF trend — skip
+  }
 
   const dir=rawDir;
   const score=totalVotes;
@@ -1605,10 +1711,12 @@ function masterSignal({cs,hour,kL,spread,orb,news,newsArr,fakeLog,minConf,tfCand
 
   const confirmTags=strategies.filter(sig=>sig.dir===dir).map(sig=>sig.name);
   if(activeNewsTrade&&activeNewsTrade.dir===dir)confirmTags.push(`${activeNewsTrade.impact.toUpperCase()}-NEWS`);
-  if(mtfBias!==0)confirmTags.push(mtfBias>0?"HTF↑":"HTF↓");
-  // Show dominant family: e.g. "A×3" meaning Family A had 3 votes
+  // Show full MTF cascade (D1,H4,H1 directions)
+  const mtfDetail=getMTFDetail(tfCandles);
+  if(mtfDetail) confirmTags.push(mtfDetail);
+  else if(mtfBias!==0) confirmTags.push(mtfBias>0?"HTF↑":"HTF↓");
   const topFam=Object.entries(activeFamCounts).sort((a,b)=>b[1]-a[1])[0];
-  if(topFam)confirmTags.push(`${topFam[0]}×${topFam[1]}`);
+  if(topFam)confirmTags.push(`${topFam[0]}×${topFam[1].toFixed(1)}`);
 
   // nearRound gate removed — was blocking signals when gold sits at round numbers like $3300.00
   const extMult=3.0; // block only if price is very extended (3×ATR beyond prev day high/low)
@@ -2358,103 +2466,6 @@ function VoteBar({buyVotes,sellVotes}){
   );
 }
 
-// ── RunRow — proper component so useState is never called inside .map() ──
-function RunRow({r}){
-  const [expanded,setExpanded]=React.useState(false);
-  const rawPnl=+(r.endBal-r.startBal).toFixed(2);
-  const won=rawPnl>=0;
-  const wr2=r.trades>0?Math.round(r.wins/r.trades*100):0;
-  return(
-    <div style={{background:PANEL,borderRadius:"8px",marginBottom:"6px",
-      border:`1px solid ${won?GREEN+"30":RED+"30"}`,borderLeft:`3px solid ${won?GREEN:RED}`}}>
-      {/* Header row — tap to expand */}
-      <div onClick={()=>setExpanded(e=>!e)} style={{padding:"12px 14px",cursor:"pointer"}}>
-        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"6px"}}>
-          <div style={{display:"flex",gap:"8px",alignItems:"center"}}>
-            <span style={{fontSize:"12px",fontWeight:"700",color:TEXT}}>Run #{r.runNum}</span>
-            {r.ts&&<span style={{fontSize:"8px",color:DIM,fontFamily:"'JetBrains Mono',monospace"}}>{fmtDateShort(r.ts)}</span>}
-            {r.duration>0&&<span style={{fontSize:"8px",color:DIM}}>{fmtDur(r.duration)}</span>}
-          </div>
-          <div style={{display:"flex",gap:"8px",alignItems:"center"}}>
-            <span style={{fontSize:"16px",fontWeight:"700",color:won?GREEN:RED,fontFamily:"'JetBrains Mono',monospace"}}>
-              {won?"+":""}${rawPnl.toFixed(2)}
-            </span>
-            <span style={{fontSize:"10px",color:DIM}}>{expanded?"▲":"▼"}</span>
-          </div>
-        </div>
-        <div style={{display:"flex",gap:"10px",flexWrap:"wrap",fontSize:"9px",color:DIM}}>
-          <span style={{fontFamily:"'JetBrains Mono',monospace"}}>${r.startBal?.toFixed(2)} → <span style={{color:won?GREEN:RED}}>${r.endBal?.toFixed(2)}</span></span>
-          <span>{r.trades||0} trades · <span style={{color:wr2>50?GREEN:wr2>35?GOLD:RED,fontWeight:"600"}}>{wr2}% WR</span></span>
-          {r.tp3>0&&<span style={{color:GOLD}}>🏆 {r.tp3} TP3</span>}
-          {r.locked>0&&<span style={{color:GOLD}}>🔒 +${r.locked?.toFixed(2)} locked</span>}
-        </div>
-      </div>
-      {/* Expanded trade list */}
-      {expanded&&(
-        <div style={{borderTop:`1px solid ${BORDER}`,padding:"10px 12px"}}>
-          {(!r.log||r.log.length===0)?(
-            <div style={{fontSize:"9px",color:DIM,textAlign:"center",padding:"8px 0"}}>No trade log for this run</div>
-          ):(
-            <>
-              <div style={{fontSize:"9px",color:DIM,marginBottom:"8px",textTransform:"uppercase",letterSpacing:"0.5px"}}>
-                Trade Log · {r.log.length} trade{r.log.length!==1?"s":""}
-              </div>
-              {r.log.map((e,j)=>{
-                const tpH=e.tpHits||[];
-                const hasTp1=tpH.some(x=>x==="TP1");
-                const hasTp2=tpH.some(x=>x==="TP2");
-                const hasTp3=tpH.some(x=>x==="TP3🏆");
-                const finalR=e.finalResult||e.result||"";
-                const isSL=finalR==="SL"||finalR==="TRAIL";
-                const epnl=+(e.pnl||0);
-                const tradeNum=r.log.length-j;
-                return(
-                  <div key={j} style={{padding:"7px 10px",marginBottom:"4px",borderRadius:"6px",
-                    background:epnl>=0?"#071207":"#120507",
-                    borderLeft:`2px solid ${epnl>=0?GREEN:RED}`}}>
-                    {/* Row 1: number, direction, TP/SL badges, P&L */}
-                    <div style={{display:"flex",alignItems:"center",gap:"5px",marginBottom:"3px"}}>
-                      <span style={{fontSize:"8px",color:DIM,fontFamily:"'JetBrains Mono',monospace",flexShrink:0,minWidth:"20px"}}>#{tradeNum}</span>
-                      <span style={{fontSize:"9px",fontWeight:"700",color:e.dir==="BUY"?GREEN:RED,flexShrink:0}}>
-                        {e.dir==="BUY"?"▲ BUY":"▼ SELL"}
-                      </span>
-                      <div style={{display:"flex",gap:"3px",flex:1,flexWrap:"wrap"}}>
-                        {[["TP1",hasTp1,GREEN,"✅"],["TP2",hasTp2,GREEN,"✅"],["TP3",hasTp3,GOLD,"🏆"]].map(([lbl,hit,col,ico])=>(
-                          <span key={lbl} style={{fontSize:"7px",padding:"1px 4px",borderRadius:"3px",fontWeight:"700",
-                            color:hit?col:"#2a2a2a",background:hit?col+"18":"#111",
-                            border:`1px solid ${hit?col+"40":"#1e1e1e"}`}}>
-                            {lbl}{hit?ico:""}
-                          </span>
-                        ))}
-                        {isSL&&(
-                          <span style={{fontSize:"7px",padding:"1px 4px",borderRadius:"3px",fontWeight:"700",
-                            color:RED,background:RED+"18",border:`1px solid ${RED}40`}}>SL❌</span>
-                        )}
-                      </div>
-                      <span style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:"700",fontSize:"10px",
-                        color:epnl>=0?GREEN:RED,flexShrink:0}}>
-                        {epnl>=0?"+":""}${epnl.toFixed(2)}
-                      </span>
-                    </div>
-                    {/* Row 2: entry→exit, lots, date */}
-                    <div style={{display:"flex",gap:"6px",alignItems:"center",flexWrap:"wrap"}}>
-                      <span style={{fontSize:"7px",color:"#444",fontFamily:"'JetBrains Mono',monospace"}}>
-                        {e.entry}→{e.exitP||"…"}
-                      </span>
-                      {e.lots!=null&&<span style={{fontSize:"7px",color:"#333"}}>×{e.lots}L</span>}
-                      {e.ts&&<span style={{fontSize:"7px",color:"#2a2a2a",marginLeft:"auto"}}>{fmtDateShort(e.ts)}</span>}
-                    </div>
-                  </div>
-                );
-              })}
-            </>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
-
 function MTFBadge({bias}){
   if(bias===0)return<span style={{fontSize:"8px",color:DIM,padding:"1px 5px",background:"#111",borderRadius:"3px",fontFamily:"'JetBrains Mono',monospace"}}>HTF neutral</span>;
   const col=bias>0?GREEN:RED,label=bias>0?"HTF BULL ↑":"HTF BEAR ↓";
@@ -2709,6 +2720,9 @@ function App(){
   const rMinConf=useRef(2);
   const rLog=useRef([]);
   const rStreak=useRef({cur:0,dir:""});
+  const rTradeId=useRef(0); // monotonic counter — groups partials in log
+  const rRecoveryMode=useRef(false); // true = 3+ consecutive losses
+  const rRecoveryDebt=useRef(0); // total $ to recover
   const rProfitTarget=useRef(500);
   const rLockedProfits=useRef(0);
   const rTargetHit=useRef(false);
@@ -2815,7 +2829,7 @@ function App(){
     rAsianC.current=[];rTrend.current=0.02;rTickN.current=0;rLog.current=[];
     rStreak.current={cur:0,dir:""};rSessionSecs.current=0;rSessionStart.current=null;
     rTargetHit.current=false;rEquityH.current=[nb];rSessPnl.current={london:0,ny:0,tokyo:0};
-    rLastTradeTs.current=0;rLockedProfits.current=0;// 0 = no cooldown on fresh start
+    rLastTradeTs.current=0;rLockedProfits.current=0;rTradeId.current=0;rRecoveryMode.current=false;rRecoveryDebt.current=0;
     rPyramidLevel.current=0;rLastAddPrice.current=0;
     rStratTable.current={};rEquityPeak.current=nb;
     rLastDayRoll.current="";
@@ -2932,23 +2946,14 @@ function App(){
             p2Done:exit.result==="TP2"?true:t.p2Done,
             p3Done:exit.result==="TP3🏆"?true:t.p3Done,
             sl:newSL,beDone:true,
-            highWater:t.highWater,lowWater:t.lowWater,
-            // Accumulate partial P&L on the trade object for grouped log display
-            partialPnl:+((t.partialPnl||0)+pnl).toFixed(2),
-            tpHits:[...(t.tpHits||[]),exit.result],
-          };
+            highWater:t.highWater,lowWater:t.lowWater};
           rTrade.current=upd;setTrade({...upd});
           rBalance.current=+(rBalance.current+pnl).toFixed(2);setBalance(rBalance.current);
           rPeakBal.current=Math.max(rPeakBal.current,rBalance.current);setPeakBal(rPeakBal.current);
           rStats.current={...rStats.current,pnl:+(rStats.current.pnl+pnl).toFixed(2)};setStats({...rStats.current});
           const emoji=exit.result==="TP3🏆"?"🏆":exit.result==="TP4🚀"?"🚀":"🎯";
           setStatus(`${emoji} ${exit.result} +$${pnl.toFixed(2)} · SL locked @ ${newSL.toFixed(2)}`);
-          // Update the OPEN trade's log entry in-place (grouped display)
-          rLog.current=rLog.current.map((le,li)=>li===0&&le.tradeId===t.tradeId
-            ?{...le,tpHits:[...(le.tpHits||[]),exit.result],partialPnl:+((le.partialPnl||0)+pnl).toFixed(2)}
-            :le
-          );
-          setLog([...rLog.current]);
+          pushLog({won:true,result:exit.result,dir:t.dir,strength:t.strength,confirms:t.confirms,entry:t.entry,exitP:exit.exitPrice.toFixed(2),pnl,time:fmtTime(),ts:candle.ts,tradeMode:"PARTIAL",tradeId:t.tradeId,lots:t.lots});
           checkProfitTarget();
 
           // ── ADD-ON POSITION AT TP1 (Feature 2) ──────────────────────
@@ -2956,11 +2961,14 @@ function App(){
           // the same direction AND no trade2 is already running, open a
           // fresh position using dynamic lot sizing with the same SL/trail
           // rules. Entry is the current TP1 price.
-          if(exit.result==="TP1"&&!rTrade2.current){
+          // RECOVERY MODE: skip add-ons entirely — protect capital, one trade at a time
+          const skipAddOn=rStreak.current.dir==="L"&&rStreak.current.cur>=3;
+          if(exit.result==="TP1"&&!rTrade2.current&&!skipAddOn){
             const addOnSig=masterSignal({
               cs:newC,hour,kL:rKLevels.current,spread,orb:rOrb.current,
               news:rActiveNews.current,newsArr:rNews.current,fakeLog:rFakeLog.current,
-              minConf:rMinConf.current,tfCandles:rTfCandles.current,inst:rInstrument.current,
+              minConf:Math.max(rMinConf.current,3),tfCandles:rTfCandles.current,
+              inst:rInstrument.current,mktState:rMktState.current,candleTs:candle.ts,
             });
             if(addOnSig&&addOnSig.dir===t.dir){
               const addEntry=+exit.exitPrice.toFixed(2);
@@ -2982,17 +2990,16 @@ function App(){
                 seteRegime:addOnSig.seteRegime||null,
                 mktState:rMktState.current||"NORMAL",
               });
-              // TP1 re-entry — use same RR as original signal, apply full trail logic,
-              // and use the same vote-driven lot sizer (recovery sizing included).
-              const addRR = addOnSig.rr || [1.5, 3.0, 6.0];
+              // TP1 re-entry — use same RR as original signal, apply full trail logic
+              const addRR = addOnSig.rr || [1.8, 3.2, 5.5];
               const addTrade={
                 ...addOnSig,
                 entry:addEntry, sl:addSL.sl, slD:addSL.slD,
                 tp1:+(t.dir==="BUY"?addEntry+addSL.slD*addRR[0]:addEntry-addSL.slD*addRR[0]).toFixed(2),
                 tp2:+(t.dir==="BUY"?addEntry+addSL.slD*addRR[1]:addEntry-addSL.slD*addRR[1]).toFixed(2),
                 tp3:+(t.dir==="BUY"?addEntry+addSL.slD*addRR[2]:addEntry-addSL.slD*addRR[2]).toFixed(2),
-                // Lots from full vote-driven sizer — no artificial cap
-                lots:+Math.min(Math.max(addLots,MIN_LOT),5.0).toFixed(4),
+                // Use vote-driven caps — same as main trade sizer
+                lots:+Math.min(Math.max(addLots,MIN_LOT),MAX_LOT_NORMAL).toFixed(4),
                 pnl:0,p1Done:false,p2Done:false,p3Done:false,
                 // Start trailing from scratch on new position (same 50%/30% rules)
                 trailing:false,beDone:false,posNum:2,isAddOn:true,
@@ -3036,21 +3043,12 @@ function App(){
           rPyramidLevel.current=0;rLastAddPrice.current=0;
           rEquityPeak.current=Math.max(rEquityPeak.current,rBalance.current);
           const prevStr=rStreak.current;
-          // In recovery: track how much we've recovered; exit recovery when debt paid
-          const prevDebt = prevStr.lastLossDollars||0;
-          const wasInRecovery = prevStr.dir==="L" && prevStr.cur>=3 && prevDebt>0;
-          const newDebt = wasInRecovery && won ? Math.max(0, +(prevDebt - Math.abs(pnl)).toFixed(2)) : prevDebt;
-          const recoveryComplete = wasInRecovery && won && newDebt<=0;
-
           rStreak.current=won
-            ?(recoveryComplete
-              // Recovery fully paid — reset streak entirely
-              ?{cur:1,dir:"W",lastLossDollars:0,recoveryComplete:true}
-              :(prevStr.dir==="W"
-                ?{cur:prevStr.cur+1,dir:"W",lastLossDollars:newDebt}
-                :{cur:1,dir:"W",lastLossDollars:newDebt}))
+            ?(prevStr.dir==="W"
+              ?{cur:prevStr.cur+1,dir:"W",lastLossDollars:0}  // reset loss on win
+              :{cur:1,dir:"W",lastLossDollars:0})              // reset loss on first win
             :(prevStr.dir==="L"
-              // Accumulate total loss across consecutive losses
+              // Accumulate total loss across consecutive losses so recovery covers the full hole
               ?{cur:prevStr.cur+1,dir:"L",lastLossDollars:+(Math.abs(pnl)+(prevStr.lastLossDollars||0)).toFixed(2)}
               :{cur:1,dir:"L",lastLossDollars:+Math.abs(pnl).toFixed(2)});
           setStreak(rStreak.current);
@@ -3072,17 +3070,7 @@ function App(){
           setLastResult({icon,text:`${exit.result} · ${t.dir} · ${won?"+":""}$${pnl.toFixed(2)}`,won});
           setTimeout(()=>setLastResult(null),4000);
           setStatus("⏳ Scanning — last: "+exit.result+" "+t.dir+" "+(won?"+":"")+"$"+pnl.toFixed(2));
-          // Update the grouped log entry with final result
-          const allTpHits=[...(t.tpHits||[]),exit.result];
-          const totalPnl=+((t.partialPnl||0)+pnl).toFixed(2);
-          rLog.current=rLog.current.map((le,li)=>{
-            if(le.tradeId===t.tradeId){
-              return{...le,tpHits:allTpHits,partialPnl:totalPnl,pnl:totalPnl,
-                finalResult:exit.result,won:totalPnl>0,open:false,exitP:exit.exitPrice.toFixed(2)};
-            }
-            return le;
-          });
-          setLog([...rLog.current]);
+          pushLog({won,result:exit.result,dir:t.dir,strength:t.strength,confirms:t.confirms,entry:t.entry,exitP:exit.exitPrice.toFixed(2),pnl,time:fmtTime(),ts:candle.ts,tradeMode:t.tradeMode,tradeId:t.tradeId,lots:t.lots,finalClose:true});
           checkProfitTarget();
           if(rMode.current!=="forward")setCandles([...newC]);
           return;
@@ -3094,6 +3082,8 @@ function App(){
       // level < MAX_PYRAMIDS, price moved ADD_STEP since last add, and
       // ATR regime allows it (expansion) with signal confirmation.
       const tr2=rTrade.current;
+      // RECOVERY MODE: no pyramiding — one clean position only until debt is cleared
+      if(rStreak.current.dir==="L"&&rStreak.current.cur>=3) {if(rMode.current!=="forward")setCandles([...newC]);return;}
       if(tr2&&tr2.trailing&&!rTrade2.current&&rPyramidLevel.current<MAX_PYRAMIDS){
         const addStep=Math.max(atr*0.8, 1.0);
         const priceMoved=Math.abs(price-(rLastAddPrice.current||tr2.entry));
@@ -3199,6 +3189,9 @@ function App(){
 
     if(dayLossHit){setPhase("STANDBY");setStatus("🛑 Daily loss limit — standing down");return;}
     if(isNewsBlackout(rNews.current,candle.ts)){setPhase("STANDBY");setStatus("📰 News blackout");return;}
+    // Tighter spread gate: normal=1.20, recovery=0.80 (avoid expensive entries when in debt)
+    const spreadLimit=rStreak.current.dir==="L"&&rStreak.current.cur>=3?0.80:SPREAD_LIMITS[rInstrument.current]||1.20;
+    if(spread>spreadLimit){setPhase("STANDBY");setStatus(`⏳ Spread ${spread.toFixed(2)} > ${spreadLimit} · waiting`);return;}
 
     // ── MARKET STATE DETECTION ─────────────────────────────────────
     const mState=detectMarketState(newC);
@@ -3326,6 +3319,16 @@ function App(){
         if(rMode.current!=="forward")setCandles([...newC]);
         return;
       }
+      // Recovery mode (3+ losses): REQUIRE HTF alignment — no counter-trend trades while in debt
+      if(rStreak.current.dir==="L"&&rStreak.current.cur>=3&&mtfBias!==0){
+        const htfAligned=(mtfBias>0&&sig.dir==="BUY")||(mtfBias<0&&sig.dir==="SELL");
+        if(!htfAligned){
+          setPhase("SCANNING");
+          setStatus("🔄 Recovery · HTF disagrees · skipping counter-trend");
+          if(rMode.current!=="forward")setCandles([...newC]);
+          return;
+        }
+      }
 
       // Lot multiplier: only apply HGE boost (expansion/kill), never penalize below 1.0
       // sesBoost and ultraMult are already 1.0 (neutralized). hgeMult can reduce in ranging.
@@ -3371,21 +3374,15 @@ function App(){
 
       // Trade starts with structure-based SL. Trail activates when price reaches 50%
       // of entry→TP1 — at that point SL snaps to BE then follows using 40%-of-move formula.
-      const tradeId=Date.now()+Math.random(); // unique ID for grouped log
       const t={...finalSig, sl:finalSig.sl, slD:finalSig.slD, lots, pnl:0,
         p1Done:false, p2Done:false, p3Done:false,
         trailing:false, beDone:false, posNum:1, inst:rInstrument.current,
         highWater:finalSig.entry, lowWater:finalSig.entry,
         riskDollars, riskPct, openCandle:newC.length,
-        seteVotes:finalSig.seteIds||[], seteRegime:finalSig.seteRegime||"TRANSITION",
-        tradeId, tpHits:[], partialPnl:0};
+        seteVotes:finalSig.seteIds||[], seteRegime:finalSig.seteRegime||"TRANSITION"};
       rTrade.current=t;
+      rTradeId.current+=1; t.tradeId=rTradeId.current;
       rDayTrades.current+=numPos;setDayTrades(rDayTrades.current);setTrade(t);setPhase("IN_TRADE");
-      // Push one OPEN entry — partials update it in-place; full close finalises it
-      pushLog({tradeId,open:true,won:null,result:"OPEN",dir:sig.dir,strength:sig.strength,
-        confirms:sig.confirms,entry:sig.entry,exitP:"—",pnl:0,partialPnl:0,tpHits:[],
-        lots,time:fmtTime(),ts:candle.ts,tradeMode:"BALANCED",
-        tp1:finalSig.tp1,tp2:finalSig.tp2,tp3:finalSig.tp3,sl:finalSig.sl});
 
       const killModeLabel=hge.killMode==="KILL_MAX"?"🔴KILL_MAX ":hge.killMode==="KILL"?"🟡KILL ":"";
       const zoneLabel=dayDD>=CAUTION_PCT?"⚠CAUTION ":"";
@@ -3394,10 +3391,8 @@ function App(){
       const streakLabel=hotStreak?`🔥${rStreak.current.cur}W`:inRecovery?`⚠${rStreak.current.cur}L`:"";
       const hmrLabel=hmrActive?"🚧HMR ":"";
       const regimeLabel=hge.regime==="expansion"?"⚡EXP ":"";
-      const sesBoost=1.0;
       const sesLabel=sesBoost>1.2?"🔥LON/NY ":sesBoost<0.9?"🌙ASIA ":"";
-      const recoveryLabel=inRecovery?`🔄REC(${rStreak.current.cur}L/$${(rStreak.current.lastLossDollars||0).toFixed(0)}) `:"";
-      setStatus(`${posLabel}${killModeLabel}${zoneLabel}${hmrLabel}${regimeLabel}${sesLabel}${recoveryLabel}⚡ ${sig.dir} @ ${sig.entry} · SL:${finalSig.sl} · TP1:${finalSig.tp1} · risk $${riskDollars.toFixed(2)} (${Math.round(riskPct*100)}%) · ×${compositeMult.toFixed(2)} · ${phaseLabel} ${streakLabel} · ${sig.strength}%`);
+      setStatus(`${posLabel}${killModeLabel}${zoneLabel}${hmrLabel}${regimeLabel}${sesLabel}⚡ ${sig.dir} @ ${sig.entry} · SL:${finalSig.sl} · TP1:${finalSig.tp1} · risk $${riskDollars.toFixed(2)} (${Math.round(riskPct*100)}%) · ×${compositeMult.toFixed(2)} · ${phaseLabel} ${streakLabel} · ${sig.strength}%`);
 
       if(numPos>=2){
         const t2={...finalSig, sl:finalSig.sl, slD:finalSig.slD, lots, pnl:0,
@@ -3697,6 +3692,9 @@ function App(){
             minConf:rMinConf.current,tfCandles:tfc,inst:rInstrument.current});
           let sig0=null;
           if(sig0raw&&sig0raw.strength>=40){sig0=sig0raw;}
+        // Update MTF display label
+        const mtfDetailStr=getMTFDetail(tfc);
+        if(mtfDetailStr) setLiveStatus(prev=>`${prev.split('·')[0]}· MTF: ${mtfDetailStr}`);
           if(sig0&&rRunning.current&&!rTrade.current){
             setLastSignalVotes({buy:sig0.buyVotes,sell:sig0.sellVotes,dir:sig0.dir,confirms:sig0.confirms});
             setLastMTFBias(sig0.mtfBias||0);setLastTradeMode("BALANCED");
@@ -3706,6 +3704,7 @@ function App(){
             const lots=+Math.min(Math.max(+(rawLots/numPos).toFixed(4),MIN_LOT),lotCap).toFixed(4);
             const t={...sig0,sl:sig0.sl,slD:sig0.slD,lots,pnl:0,p1Done:false,p2Done:false,p3Done:false,trailing:false,beDone:false,posNum:1,inst:rInstrument.current,
               highWater:sig0.entry,lowWater:sig0.entry,seteVotes:sig0.seteIds||[],seteRegime:sig0.seteRegime||"TRANSITION"};
+            rTradeId.current+=1; t.tradeId=rTradeId.current;
             rTrade.current=t;
             rDayTrades.current+=numPos;setDayTrades(rDayTrades.current);setTrade(t);setPhase("IN_TRADE");
             const posLabel0=numPos>=2?"🔥×"+numPos+" ":"🔥 ";
@@ -3966,6 +3965,7 @@ function App(){
               highWater:sig_tick.entry,lowWater:sig_tick.entry,tradeMode:"TICK",
               seteVotes:sig_tick.seteIds||[],seteRegime:sig_tick.seteRegime||"TRANSITION"};
             rTrade.current=t_tick;
+            rTradeId.current+=1; t_tick.tradeId=rTradeId.current;
             rDayTrades.current+=1;setDayTrades(rDayTrades.current);
             setTrade(t_tick);setPhase("IN_TRADE");
             setStatus(`🔥 ${sig_tick.dir} @ ${sig_tick.entry} · ${sig_tick.confirms} · ${sig_tick.strength}%`);
@@ -4025,7 +4025,7 @@ function App(){
     {id:"engine",label:"Mode"},
     {id:"strategies",label:"Strategies"},
     {id:"heatmap",label:"Sessions"},
-    {id:"log",label:"Log"+(log.length>0?" ("+log.length+")":"")},
+    {id:"log",label:(()=>{const ids=new Set();log.forEach(e=>e.tradeId&&ids.add(e.tradeId));const cnt=ids.size||log.filter(e=>e.finalClose||e.won===false).length;return "Log"+(cnt>0?" ("+cnt+")":"");})()},
     {id:"history",label:"History"+(runHistory.length>0?" ("+runHistory.length+")":"")},
     {id:"settings",label:"Settings"},
   ];
@@ -4202,6 +4202,22 @@ function App(){
           <span style={{fontSize:"9px",color:DIM,flex:1,textAlign:"right"}}>safe · not at risk</span>
         </div>
       )}
+      {/* Recovery mode banner — shows when 3+ consecutive losses */}
+      {streak.dir==="L"&&streak.cur>=3&&(
+        <div style={{background:"#1a0800",borderBottom:"1px solid #f5a62330",padding:"5px 14px",
+          display:"flex",alignItems:"center",gap:"8px",flexShrink:0,animation:"blink 2s infinite"}}>
+          <span style={{fontSize:"12px"}}>⚠️</span>
+          <div style={{flex:1}}>
+            <span style={{fontSize:"10px",color:"#f5a623",fontWeight:"700"}}>RECOVERY MODE</span>
+            <span style={{fontSize:"9px",color:"#f5a62388",marginLeft:"6px"}}>
+              {streak.cur} consecutive losses · sizing to recover debt
+            </span>
+          </div>
+          <span style={{fontSize:"9px",color:"#f5a623",fontFamily:"'JetBrains Mono',monospace",fontWeight:"700"}}>
+            Debt: ${Math.abs(stats.pnl<0?stats.pnl:0).toFixed(2)}
+          </span>
+        </div>
+      )}
       <div style={{background:"#0a0a0c",borderBottom:`1px solid ${BORDER}`,padding:"4px 14px",flexShrink:0}}>
         <div style={{display:"flex",justifyContent:"space-between",fontSize:"9px",marginBottom:"3px"}}>
           <span style={{color:DIM}}>Target <span style={{color:GOLD}}>${profitTarget}</span> · {progressPct.toFixed(1)}%</span>
@@ -4335,7 +4351,7 @@ function App(){
           {!running && mode!=="backtest" &&(
             <div style={{flex:1,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:"16px"}}>
               <div style={{fontSize:"40px"}}>💰</div>
-              <div style={{fontSize:"14px",fontWeight:"700",color:GOLD,letterSpacing:"1px"}}>MONEY HEIST v11</div>
+              <div style={{fontSize:"14px",fontWeight:"700",color:GOLD,letterSpacing:"1px"}}>MONEY HEIST v10</div>
               <div style={{fontSize:"10px",color:DIM}}>XAU/USD · Live Paper Trading</div>
               <button onClick={startForwardTest}
                 style={{marginTop:"8px",padding:"16px 48px",borderRadius:"12px",background:RED,
@@ -4768,110 +4784,163 @@ function App(){
         )}
 
         {/* ── LOG TAB ── */}
-        {tab==="log"&&(
+        {tab==="log"&&(()=>{
+          // ── GROUP raw log entries by tradeId into one row per trade ──
+          // Each trade: one entry per partial (TP1,TP2,TP3) plus final close (SL/TRAIL/TP4)
+          // Display: #N BUY/SELL entry  TP1✅ TP2✅ TP3🏆  SL❌  +$X.XX
+          const grouped=[];
+          const seen=new Map();
+          const rawLog=[...log];
+          rawLog.forEach(e=>{
+            const tid=e.tradeId||("nt_"+e.entry+"_"+e.dir); // fallback for old entries without id
+            if(!seen.has(tid)){
+              seen.set(tid,{
+                tid, num:seen.size+1,
+                dir:e.dir, entry:e.entry, strength:e.strength,
+                confirms:e.confirms, tradeMode:e.tradeMode,
+                ts:e.ts, partials:[], finalResult:null,
+                totalPnl:0, lots:e.lots||null,
+              });
+              grouped.push(seen.get(tid));
+            }
+            const g=seen.get(tid);
+            g.totalPnl=+(g.totalPnl+(e.pnl||0)).toFixed(2);
+            if(e.finalClose||(!e.tradeMode)||(e.tradeMode!=="PARTIAL"&&!e.result?.startsWith("TP")&&e.result!=="ADD-ON")){
+              g.finalResult=e.result;
+              g.exitP=e.exitP;
+            } else {
+              g.partials.push(e.result);
+            }
+          });
+
+          // Count only closed trades (have finalResult)
+          const closedTrades=grouped.filter(g=>g.finalResult);
+          const wonTrades=closedTrades.filter(g=>!g.finalResult?.includes("SL")&&!g.finalResult?.includes("TRAIL")||g.totalPnl>0);
+          const tradeWR=closedTrades.length>0?Math.round(wonTrades.length/closedTrades.length*100):0;
+
+          return(
           <div>
-            {/* Summary row — trade count = entries opened */}
-            <div style={{display:"flex",justifyContent:"space-between",fontSize:"10px",color:DIM,marginBottom:"10px",fontFamily:"'JetBrains Mono',monospace"}}>
-              <span>{stats.w}W · {stats.l}L · {total>0?wr+"% WR":"—"} · {stats.tp3} TP3</span>
-              <span style={{color:stats.pnl>=0?GREEN:RED,fontWeight:"600"}}>{stats.pnl>=0?"+":""}${stats.pnl.toFixed(2)}</span>
+            {/* Summary bar */}
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",
+              fontSize:"10px",color:DIM,marginBottom:"10px",fontFamily:"'JetBrains Mono',monospace",
+              background:"#0a0a0c",borderRadius:"6px",padding:"7px 10px"}}>
+              <span style={{color:TEXT}}>
+                <span style={{color:GREEN,fontWeight:"700"}}>{wonTrades.length}W</span>
+                {" · "}
+                <span style={{color:RED,fontWeight:"700"}}>{closedTrades.length-wonTrades.length}L</span>
+                {" · "}
+                <span style={{color:tradeWR>55?GREEN:tradeWR>40?GOLD:RED,fontWeight:"700"}}>{tradeWR}% WR</span>
+                {" · "}
+                <span style={{color:DIM}}>{closedTrades.length} trades</span>
+              </span>
+              <span style={{color:stats.pnl>=0?GREEN:RED,fontWeight:"700",fontSize:"12px"}}>
+                {stats.pnl>=0?"+":""}${stats.pnl.toFixed(2)}
+              </span>
             </div>
-            {/* Recovery mode banner */}
-            {streak.dir==="L"&&streak.cur>=3&&streak.lastLossDollars>0&&(
-              <div style={{padding:"8px 12px",marginBottom:"8px",borderRadius:"6px",
-                background:"#1a0800",border:`1px solid ${GOLD}40`,display:"flex",gap:"8px",alignItems:"center"}}>
-                <span style={{fontSize:"11px"}}>⚠️</span>
-                <div style={{flex:1}}>
-                  <div style={{fontSize:"9px",color:GOLD,fontWeight:"700"}}>RECOVERY MODE · {streak.cur} consecutive losses</div>
-                  <div style={{fontSize:"8px",color:DIM,marginTop:"1px"}}>Deficit: <span style={{color:RED,fontWeight:"600"}}>${streak.lastLossDollars.toFixed(2)}</span> · Dynamic lots active · Will auto-exit when recovered</div>
-                </div>
-              </div>
-            )}
-            {log.length===0?(
+
+            {grouped.length===0?(
               <div style={{padding:"48px",textAlign:"center",color:DIM}}>
                 <div style={{fontSize:"28px",marginBottom:"10px"}}>🎭</div>
                 <div style={{fontSize:"12px"}}>No trades yet</div>
-                <div style={{fontSize:"9px",marginTop:"6px",color:DIM}}>Load backtest data or start forward test in the Mode tab</div>
+                <div style={{fontSize:"9px",marginTop:"6px"}}>Start forward test or run backtest</div>
               </div>
-            ):log.map((e,i)=>{
-              // Determine TP badges to show
-              const tpHits = e.tpHits||[];
-              const hasTp1 = tpHits.some(r=>r==="TP1");
-              const hasTp2 = tpHits.some(r=>r==="TP2");
-              const hasTp3 = tpHits.some(r=>r==="TP3🏆");
-              const finalR = e.finalResult||e.result;
-              const isSL   = finalR==="SL"||finalR==="TRAIL";
-              const isOpen = e.open===true;
-              const totalPnl = e.pnl||0;
-              const tradeNum = log.length - i; // chronological trade number
+            ):grouped.map((g,i)=>{
+              const isSL=g.finalResult?.includes("SL")||g.finalResult?.includes("TRAIL")&&g.totalPnl<=0;
+              const isOpen=!g.finalResult;
+              const won=!isSL&&!isOpen&&g.totalPnl>0;
+              const borderCol=isOpen?GOLD:won?GREEN:RED;
+              const bg=isOpen?"#0b0b08":won?"#071207":"#120507";
 
-              // Card colour: open=gold border, won=green, loss=red
-              const cardBorder = isOpen ? GOLD : totalPnl>=0 ? GREEN : RED;
-              const cardBg     = isOpen ? "#0d0a00" : totalPnl>=0 ? "#071207" : "#120507";
+              // Build outcome badges
+              const badges=[];
+              // Partials that hit
+              g.partials.forEach(r=>{
+                if(r==="TP1")badges.push({txt:"TP1",icon:"✅",col:GREEN});
+                else if(r==="TP2")badges.push({txt:"TP2",icon:"✅",col:"#66BB6A"});
+                else if(r==="TP3🏆"||r==="TP3")badges.push({txt:"TP3",icon:"🏆",col:GOLD});
+                else if(r==="TP4🚀")badges.push({txt:"TP4",icon:"🚀",col:GOLD});
+              });
+              // Final result
+              if(g.finalResult){
+                if(g.finalResult.includes("TP4"))badges.push({txt:"TP4",icon:"🚀",col:GOLD});
+                else if(g.finalResult.includes("TP3"))badges.push({txt:"TP3",icon:"🏆",col:GOLD});
+                else if(g.finalResult.includes("TP2"))badges.push({txt:"TP2",icon:"✅",col:"#66BB6A"});
+                else if(g.finalResult.includes("TP1"))badges.push({txt:"TP1",icon:"✅",col:GREEN});
+                else if(g.finalResult.includes("SL"))badges.push({txt:"SL",icon:"❌",col:RED});
+                else if(g.finalResult.includes("TRAIL"))badges.push({txt:"TRAIL",icon:"🔄",col:GOLD});
+              } else {
+                badges.push({txt:"OPEN",icon:"⏳",col:GOLD});
+              }
 
               return(
-                <div key={i} style={{padding:"9px 12px",marginBottom:"5px",borderRadius:"7px",
-                  background:cardBg,borderLeft:`3px solid ${cardBorder}`,
+                <div key={g.tid} style={{display:"flex",flexDirection:"column",padding:"8px 10px",
+                  marginBottom:"4px",borderRadius:"7px",background:bg,
+                  borderLeft:`3px solid ${borderCol}`,
                   animation:i===0?"slideIn .15s ease":"none"}}>
-
-                  {/* Row 1: trade number, direction, result badges, P&L */}
-                  <div style={{display:"flex",alignItems:"center",gap:"6px",marginBottom:"4px"}}>
-                    <span style={{fontSize:"9px",color:DIM,fontFamily:"'JetBrains Mono',monospace",flexShrink:0,minWidth:"22px"}}>#{tradeNum}</span>
-                    <span style={{fontSize:"10px",fontWeight:"700",color:e.dir==="BUY"?GREEN:RED,flexShrink:0}}>{e.dir==="BUY"?"▲ BUY":"▼ SELL"}</span>
-
-                    {/* TP/SL badges */}
-                    <div style={{display:"flex",gap:"3px",flex:1,flexWrap:"wrap"}}>
-                      {/* TP1 */}
-                      <span style={{fontSize:"8px",padding:"1px 5px",borderRadius:"3px",fontWeight:"700",
-                        color:hasTp1?GREEN:"#333",background:hasTp1?GREEN+"18":"#1a1a1a",
-                        border:`1px solid ${hasTp1?GREEN+"40":"#222"}`}}>
-                        TP1{hasTp1?"✅":""}
+                  {/* Row 1: trade number, direction, entry, badges, P&L */}
+                  <div style={{display:"flex",alignItems:"center",gap:"5px",flexWrap:"wrap"}}>
+                    {/* Trade number */}
+                    <span style={{fontSize:"8px",color:DIM,fontFamily:"'JetBrains Mono',monospace",
+                      background:"#1a1a1a",padding:"1px 5px",borderRadius:"3px",flexShrink:0}}>
+                      #{grouped.length-i}
+                    </span>
+                    {/* Direction */}
+                    <span style={{fontSize:"11px",fontWeight:"800",color:g.dir==="BUY"?GREEN:RED,flexShrink:0}}>
+                      {g.dir==="BUY"?"▲":"▼"} {g.dir}
+                    </span>
+                    {/* Entry price */}
+                    <span style={{fontSize:"9px",color:MUTED,fontFamily:"'JetBrains Mono',monospace",flexShrink:0}}>
+                      @{g.entry}
+                    </span>
+                    {/* Strength */}
+                    {g.strength!=null&&(
+                      <span style={{fontSize:"7.5px",color:g.strength>=70?GOLD:DIM,
+                        fontFamily:"'JetBrains Mono',monospace",flexShrink:0,
+                        padding:"1px 4px",background:"#111",borderRadius:"3px"}}>
+                        {g.strength}%
                       </span>
-                      {/* TP2 */}
-                      <span style={{fontSize:"8px",padding:"1px 5px",borderRadius:"3px",fontWeight:"700",
-                        color:hasTp2?GREEN:"#333",background:hasTp2?GREEN+"18":"#1a1a1a",
-                        border:`1px solid ${hasTp2?GREEN+"40":"#222"}`}}>
-                        TP2{hasTp2?"✅":""}
+                    )}
+                    {/* Trade mode */}
+                    {g.tradeMode&&g.tradeMode!=="PARTIAL"&&(
+                      <span style={{fontSize:"7px",color:g.tradeMode==="SNIPER"?GOLD:g.tradeMode==="SCALP"?BLUE:GREEN,
+                        padding:"1px 4px",background:"#1a1a1a",borderRadius:"3px",flexShrink:0}}>
+                        {g.tradeMode==="SNIPER"?"🎯 SNIP":g.tradeMode==="SCALP"?"📊 SCP":"⚖ BAL"}
                       </span>
-                      {/* TP3 */}
-                      <span style={{fontSize:"8px",padding:"1px 5px",borderRadius:"3px",fontWeight:"700",
-                        color:hasTp3?GOLD:"#333",background:hasTp3?GOLD+"18":"#1a1a1a",
-                        border:`1px solid ${hasTp3?GOLD+"40":"#222"}`}}>
-                        TP3{hasTp3?"🏆":""}
-                      </span>
-                      {/* SL badge */}
-                      {isSL&&<span style={{fontSize:"8px",padding:"1px 5px",borderRadius:"3px",fontWeight:"700",
-                        color:RED,background:RED+"18",border:`1px solid ${RED}40`}}>
-                        SL❌
-                      </span>}
-                      {isOpen&&<span style={{fontSize:"8px",padding:"1px 5px",borderRadius:"3px",
-                        color:GOLD,background:GOLD+"15",border:`1px solid ${GOLD}30`,
-                        animation:"blink 1.5s infinite",fontWeight:"700"}}>OPEN</span>}
-                    </div>
-
-                    {/* P&L */}
-                    <span style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:"700",fontSize:"11px",
-                      color:isOpen?GOLD:totalPnl>=0?GREEN:RED,flexShrink:0}}>
-                      {isOpen?(e.partialPnl&&e.partialPnl!==0?(e.partialPnl>=0?"+":"")+"$"+e.partialPnl.toFixed(2):"open"):
-                       (totalPnl>=0?"+":"")+"$"+totalPnl.toFixed(2)}
+                    )}
+                    <span style={{flex:1}}/>
+                    {/* Total P&L */}
+                    <span style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:"800",
+                      fontSize:"12px",color:g.totalPnl>=0?GREEN:RED,flexShrink:0}}>
+                      {g.totalPnl>=0?"+":""}${g.totalPnl.toFixed(2)}
                     </span>
                   </div>
-
-                  {/* Row 2: entry→exit price, lots, strength, date */}
-                  <div style={{display:"flex",alignItems:"center",gap:"6px",flexWrap:"wrap"}}>
-                    <span style={{fontSize:"8px",color:DIM,fontFamily:"'JetBrains Mono',monospace",flexShrink:0}}>
-                      {e.entry}→{e.exitP==="—"||!e.exitP?"…":e.exitP}
-                    </span>
-                    {e.lots!=null&&<span style={{fontSize:"7px",color:DIM}}>×{e.lots}L</span>}
-                    {e.strength!=null&&<span style={{fontSize:"7px",color:e.strength>=90?GOLD:DIM,
-                      padding:"1px 4px",background:"#1a1a1a",borderRadius:"3px",
-                      fontFamily:"'JetBrains Mono',monospace"}}>{e.strength}%</span>}
-                    {e.ts&&<span style={{fontSize:"7px",color:"#333",flexShrink:0,marginLeft:"auto"}}>{fmtDateShort(e.ts)}</span>}
+                  {/* Row 2: outcome chain + timestamp */}
+                  <div style={{display:"flex",alignItems:"center",gap:"4px",marginTop:"4px",flexWrap:"wrap"}}>
+                    {badges.map((b,bi)=>(
+                      <span key={bi} style={{fontSize:"9px",fontWeight:"700",color:b.col,
+                        padding:"1px 6px",borderRadius:"3px",
+                        background:b.col+"18",border:`1px solid ${b.col}30`,flexShrink:0,
+                        fontFamily:"'JetBrains Mono',monospace"}}>
+                        {b.icon} {b.txt}
+                      </span>
+                    ))}
+                    {g.exitP&&(
+                      <span style={{fontSize:"8px",color:"#333",fontFamily:"'JetBrains Mono',monospace",flexShrink:0,marginLeft:"2px"}}>
+                        →{g.exitP}
+                      </span>
+                    )}
+                    {g.ts&&(
+                      <span style={{fontSize:"7.5px",color:"#2a2a2a",flexShrink:0,marginLeft:"auto"}}>
+                        {fmtDateShort(g.ts)}
+                      </span>
+                    )}
                   </div>
                 </div>
               );
             })}
           </div>
-        )}
+          );
+        })()}
 
         {/* ── HISTORY TAB ── */}
         {tab==="history"&&(
@@ -4915,9 +4984,66 @@ function App(){
                 <div style={{fontSize:"12px"}}>No runs yet</div>
                 <div style={{fontSize:"9px",marginTop:"6px",color:DIM}}>Press ↺ to end a run and save it here</div>
               </div>
-            ):runHistory.map((r,i)=>(
-              <RunRow key={i} r={r}/>
-            ))}
+            ):runHistory.map((r,i)=>{
+              const pnl=+(r.endBal-r.startBal+( r.locked||0)).toFixed(2);
+              const rawPnl=+(r.endBal-r.startBal).toFixed(2);
+              const won=rawPnl>=0;
+              const wr2=r.trades>0?Math.round(r.wins/r.trades*100):0;
+              const [expanded,setExpanded]=React.useState(false);
+              return(
+                <div key={i} style={{background:PANEL,borderRadius:"8px",
+                  border:`1px solid ${won?GREEN+"30":RED+"30"}`,borderLeft:`3px solid ${won?GREEN:RED}`}}>
+                  {/* Run header — tappable to expand */}
+                  <div onClick={()=>setExpanded(e=>!e)} style={{padding:"12px 14px",cursor:"pointer"}}>
+                    <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"6px"}}>
+                      <div style={{display:"flex",gap:"8px",alignItems:"center"}}>
+                        <span style={{fontSize:"12px",fontWeight:"700",color:TEXT}}>Run #{r.runNum}</span>
+                        {r.ts&&<span style={{fontSize:"8px",color:DIM,fontFamily:"'JetBrains Mono',monospace"}}>{fmtDateShort(r.ts)}</span>}
+                        {fmtDur(r.duration)&&r.duration>0&&<span style={{fontSize:"8px",color:DIM}}>{fmtDur(r.duration)}</span>}
+                      </div>
+                      <div style={{display:"flex",gap:"8px",alignItems:"center"}}>
+                        <span style={{fontSize:"16px",fontWeight:"700",color:won?GREEN:RED,fontFamily:"'JetBrains Mono',monospace"}}>
+                          {won?"+":""}${rawPnl.toFixed(2)}
+                        </span>
+                        <span style={{fontSize:"10px",color:DIM}}>{expanded?"▲":"▼"}</span>
+                      </div>
+                    </div>
+                    <div style={{display:"flex",gap:"10px",flexWrap:"wrap",fontSize:"9px",color:DIM}}>
+                      <span style={{fontFamily:"'JetBrains Mono',monospace"}}>${r.startBal?.toFixed(2)} → <span style={{color:won?GREEN:RED}}>${r.endBal?.toFixed(2)}</span></span>
+                      <span>{r.trades||0} trades · <span style={{color:wr2>50?GREEN:wr2>35?GOLD:RED,fontWeight:"600"}}>{wr2}% WR</span></span>
+                      {r.tp3>0&&<span style={{color:GOLD}}>🏆 {r.tp3} TP3</span>}
+                      {r.locked>0&&<span style={{color:GOLD}}>🔒 +${r.locked?.toFixed(2)} locked</span>}
+                    </div>
+                  </div>
+                  {/* Expanded: all trades in this run */}
+                  {expanded&&r.log&&r.log.length>0&&(
+                    <div style={{borderTop:`1px solid ${BORDER}`,padding:"10px 12px"}}>
+                      <div style={{fontSize:"9px",color:DIM,marginBottom:"8px",textTransform:"uppercase"}}>
+                        Trade Log · {r.log.length} entries
+                      </div>
+                      {r.log.map((e,j)=>(
+                        <div key={j} style={{display:"flex",gap:"5px",alignItems:"center",padding:"5px 8px",marginBottom:"2px",
+                          borderRadius:"5px",background:e.won?"#071207":"#120507",borderLeft:`2px solid ${e.won?GREEN:RED}`,
+                          flexWrap:"wrap"}}>
+                          <span style={{color:e.won?GREEN:RED,fontWeight:"700",fontSize:"9px",fontFamily:"'JetBrains Mono',monospace",flexShrink:0}}>
+                            {e.result==="TP3🏆"?"🏆":e.result?.startsWith("TP")?"🎯":e.won?"✅":"❌"} {e.result}
+                          </span>
+                          <span style={{fontSize:"9px",color:e.dir==="BUY"?GREEN:RED,flexShrink:0,fontWeight:"600"}}>{e.dir}</span>
+                          {e.strength!=null&&<span style={{fontSize:"7px",color:e.strength>=90?GOLD:DIM,padding:"1px 4px",background:"#1a1a1a",borderRadius:"3px",fontFamily:"'JetBrains Mono',monospace"}}>{e.strength}%</span>}
+                          <span style={{fontSize:"7.5px",color:DIM,fontFamily:"'JetBrains Mono',monospace",flexShrink:0}}>{e.entry}→{e.exitP}</span>
+                          {e.ts&&<span style={{fontSize:"7px",color:"#333",flexShrink:0}}>{fmtDateShort(e.ts)}</span>}
+                          <span style={{flex:1}}/>
+                          <span style={{fontFamily:"'JetBrains Mono',monospace",fontWeight:"700",fontSize:"10px",color:e.pnl>=0?GREEN:RED,flexShrink:0}}>{e.pnl>=0?"+":""}${(+e.pnl).toFixed(2)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {expanded&&(!r.log||r.log.length===0)&&(
+                    <div style={{borderTop:`1px solid ${BORDER}`,padding:"10px 12px",fontSize:"9px",color:DIM,textAlign:"center"}}>No trade log for this run</div>
+                  )}
+                </div>
+              );
+            })}
           </div>
         )}
 
